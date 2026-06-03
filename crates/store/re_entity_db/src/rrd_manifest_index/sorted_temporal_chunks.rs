@@ -573,4 +573,82 @@ mod tests {
             assert_eq!(a.num_rows, b.num_rows);
         }
     }
+
+    /// Simulates streaming ingestion: many small deltas arriving over time.
+    ///
+    /// Run with: `cargo test --release -p re_entity_db -- bench_update --nocapture`
+    #[test]
+    fn bench_update() {
+        const N_ENTITIES: usize = 2000;
+        const N_DELTAS: usize = 40;
+        const COMPONENTS: [&str; 4] = ["test:Position", "test:Color", "test:Radius", "test:Label"];
+
+        let timeline = TimelineName::new("log_time");
+        let timeline_obj = re_chunk::Timeline::new_sequence(timeline);
+
+        // Build entity tree: flat hierarchy `/e0` through `/e{N-1}`
+        let entities: Vec<EntityPath> = (0..N_ENTITIES)
+            .map(|i| EntityPath::from(format!("/e{i}")))
+            .collect();
+        let entity_refs: Vec<&EntityPath> = entities.iter().collect();
+        let entity_tree = make_entity_tree(&entity_refs);
+
+        let components: Vec<re_chunk::ComponentIdentifier> =
+            COMPONENTS.iter().map(|c| re_chunk::ComponentIdentifier::new(*c)).collect();
+
+        // Build deltas: each delta has chunks for all entities, all components
+        // Use deterministic index-based values instead of a RNG dependency.
+        let deltas: Vec<re_log_encoding::RrdManifestTemporalMap> = (0..N_DELTAS)
+            .map(|delta_idx| {
+                let base_time = (delta_idx * 1000) as i64;
+                let mut map = re_log_encoding::RrdManifestTemporalMap::default();
+                for (ei, entity) in entities.iter().enumerate() {
+                    let mut per_component = IntMap::default();
+                    for (ci, comp) in components.iter().enumerate() {
+                        let mut chunks = std::collections::BTreeMap::default();
+                        let t_offset = ((ei * components.len() + ci) * 50) as i64;
+                        chunks.insert(
+                            ChunkId::new(),
+                            re_log_encoding::RrdManifestTemporalMapEntry {
+                                time_range: AbsoluteTimeRange::new(
+                                    TimeInt::new_temporal(base_time + t_offset),
+                                    TimeInt::new_temporal(base_time + t_offset + 100),
+                                ),
+                                num_rows: (ei * components.len() + ci + 1) as u64,
+                            },
+                        );
+                        per_component.insert(*comp, chunks);
+                    }
+                    let mut per_timeline = IntMap::default();
+                    per_timeline.insert(timeline_obj, per_component);
+                    map.insert(entity.clone(), per_timeline);
+                }
+                map
+            })
+            .collect();
+
+        let start = std::time::Instant::now();
+        let mut cache = SortedTemporalChunks::default();
+        for (i, delta) in deltas.iter().enumerate() {
+            cache.update(&entity_tree, delta);
+            if i % 10 == 9 {
+                eprintln!("  ... processed delta {}/{}", i + 1, N_DELTAS);
+            }
+        }
+        let elapsed = start.elapsed();
+
+        // Smoke test: should have all entities
+        let ent = cache.get(&timeline, &entities[0].hash()).unwrap();
+        let total_chunks: usize = ent.per_entity().len();
+        assert!(total_chunks > 0);
+
+        println!(
+            "bench_update: {} entities, {} deltas, {} components → {}ms ({} chunks total)",
+            N_ENTITIES,
+            N_DELTAS,
+            components.len(),
+            elapsed.as_secs_f64() * 1000.0,
+            total_chunks,
+        );
+    }
 }
