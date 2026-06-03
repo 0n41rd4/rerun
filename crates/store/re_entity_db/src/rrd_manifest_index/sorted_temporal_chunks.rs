@@ -436,4 +436,141 @@ mod tests {
         assert_eq!(sorted.per_entity().len(), 1);
         assert_eq!(sorted.per_entity()[0].num_rows, 25); // 10 + 15
     }
+
+    #[test]
+    fn test_incremental_update_equivalent_to_full() {
+        let timeline = TimelineName::new("test");
+        let entity = EntityPath::from("/test");
+        let component = re_chunk::ComponentIdentifier::new("test:Position");
+        let timeline_obj = re_chunk::Timeline::new_sequence(timeline);
+
+        let chunk1 = ChunkId::new();
+        let chunk2 = ChunkId::new();
+        let chunk3 = ChunkId::new();
+
+        // Delta 1: two chunks, non-adjacent time ranges
+        let mut d1 = re_log_encoding::RrdManifestTemporalMap::default();
+        {
+            let mut per_component = IntMap::default();
+            let mut chunks = std::collections::BTreeMap::default();
+            chunks.insert(
+                chunk1,
+                re_log_encoding::RrdManifestTemporalMapEntry {
+                    time_range: AbsoluteTimeRange::new(
+                        TimeInt::new_temporal(100),
+                        TimeInt::new_temporal(200),
+                    ),
+                    num_rows: 10,
+                },
+            );
+            chunks.insert(
+                chunk3,
+                re_log_encoding::RrdManifestTemporalMapEntry {
+                    time_range: AbsoluteTimeRange::new(
+                        TimeInt::new_temporal(500),
+                        TimeInt::new_temporal(600),
+                    ),
+                    num_rows: 5,
+                },
+            );
+            per_component.insert(component, chunks);
+            let mut per_timeline = IntMap::default();
+            per_timeline.insert(timeline_obj, per_component);
+            d1.insert(entity.clone(), per_timeline);
+        }
+
+        // Delta 2: one chunk, fits between delta 1's chunks temporally
+        let mut d2 = re_log_encoding::RrdManifestTemporalMap::default();
+        {
+            let mut per_component = IntMap::default();
+            let mut chunks = std::collections::BTreeMap::default();
+            chunks.insert(
+                chunk2,
+                re_log_encoding::RrdManifestTemporalMapEntry {
+                    time_range: AbsoluteTimeRange::new(
+                        TimeInt::new_temporal(300),
+                        TimeInt::new_temporal(400),
+                    ),
+                    num_rows: 7,
+                },
+            );
+            per_component.insert(component, chunks);
+            let mut per_timeline = IntMap::default();
+            per_timeline.insert(timeline_obj, per_component);
+            d2.insert(entity.clone(), per_timeline);
+        }
+
+        let entity_tree = make_entity_tree(&[&entity]);
+
+        // Incremental path: two update() calls
+        let mut incremental = SortedTemporalChunks::default();
+        incremental.update(&entity_tree, &d1);
+        incremental.update(&entity_tree, &d2);
+
+        // Full path: single update() with both deltas merged
+        let mut full = SortedTemporalChunks::default();
+        let mut combined = re_log_encoding::RrdManifestTemporalMap::default();
+        let mut per_component = IntMap::default();
+        let mut chunks = std::collections::BTreeMap::default();
+        chunks.insert(
+            chunk1,
+            re_log_encoding::RrdManifestTemporalMapEntry {
+                time_range: AbsoluteTimeRange::new(
+                    TimeInt::new_temporal(100),
+                    TimeInt::new_temporal(200),
+                ),
+                num_rows: 10,
+            },
+        );
+        chunks.insert(
+            chunk2,
+            re_log_encoding::RrdManifestTemporalMapEntry {
+                time_range: AbsoluteTimeRange::new(
+                    TimeInt::new_temporal(300),
+                    TimeInt::new_temporal(400),
+                ),
+                num_rows: 7,
+            },
+        );
+        chunks.insert(
+            chunk3,
+            re_log_encoding::RrdManifestTemporalMapEntry {
+                time_range: AbsoluteTimeRange::new(
+                    TimeInt::new_temporal(500),
+                    TimeInt::new_temporal(600),
+                ),
+                num_rows: 5,
+            },
+        );
+        per_component.insert(component, chunks);
+        let mut per_timeline = IntMap::default();
+        per_timeline.insert(timeline_obj, per_component);
+        combined.insert(entity.clone(), per_timeline);
+        full.update(&entity_tree, &combined);
+
+        let inc = incremental.get(&timeline, &entity.hash()).unwrap();
+        let full = full.get(&timeline, &entity.hash()).unwrap();
+
+        // per_component: same chunk count and order
+        let inc_comp = inc.component_chunks(&component);
+        let full_comp = full.component_chunks(&component);
+        assert_eq!(inc_comp.len(), 3);
+        assert_eq!(full_comp.len(), 3);
+        for (a, b) in inc_comp.iter().zip(full_comp.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.time_range, b.time_range);
+            assert_eq!(a.num_rows, b.num_rows);
+        }
+
+        // per_entity: same chunk count and order
+        let inc_ent = inc.per_entity();
+        let full_ent = full.per_entity();
+        assert_eq!(inc_ent.len(), 3);
+        assert_eq!(full_ent.len(), 3);
+        for (a, b) in inc_ent.iter().zip(full_ent.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.time_range, b.time_range);
+            assert_eq!(a.num_rows, b.num_rows);
+        }
+    }
 }
